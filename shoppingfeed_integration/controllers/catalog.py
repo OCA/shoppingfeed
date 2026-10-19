@@ -33,7 +33,7 @@ class CatalogController(http.Controller):
     _PRODUCT_DATA_FIELDS = [
         "barcode",
         "default_code",
-        "description_sale",
+        "description_ecommerce",
         "name",
         "product_brand_id",
         "product_template_attribute_value_ids",
@@ -672,7 +672,7 @@ class CatalogController(http.Controller):
         description_el = etree.SubElement(product_el, "description")
         full_desc = product_data["website_description"] or ""
         etree.SubElement(description_el, "full").text = etree.CDATA(full_desc)
-        short_desc = product_data["description_sale"] or ""
+        short_desc = product_data["description_ecommerce"] or ""
         etree.SubElement(description_el, "short").text = etree.CDATA(short_desc)
 
     def _add_product_price(self, store, product_el, product, batch_context=None):
