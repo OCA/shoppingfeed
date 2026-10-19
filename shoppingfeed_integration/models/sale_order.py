@@ -1,0 +1,639 @@
+# Copyright 2025 Tecnativa - Juan Carlos Oñate
+# Copyright 2026 Tecnativa - Sergio Teruel
+# License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl.html).
+import json
+from datetime import datetime, timezone
+
+import requests
+from markupsafe import Markup
+
+from odoo import _, api, fields, models
+
+
+class SaleOrder(models.Model):
+    _inherit = "sale.order"
+
+    shoppingfeed_order_ref = fields.Char(
+        string="Shoppingfeed Order ID",
+        help="Numeric order ID from Shoppingfeed API (e.g., 21786210256).",
+        copy=False,
+        index=True,
+        readonly=True,
+    )
+    shoppingfeed_reference = fields.Char(
+        help="Marketplace order reference (e.g., TEST-68fb749e8cd95).",
+        copy=False,
+        index=True,
+        readonly=True,
+    )
+    shoppingfeed_store_id = fields.Many2one(
+        comodel_name="shoppingfeed.store",
+        string="Shoppingfeed Store",
+        help="The Shoppingfeed store from which this order was imported.",
+        copy=False,
+        readonly=True,
+        index=True,
+    )
+    shoppingfeed_channel_id = fields.Many2one(
+        comodel_name="shoppingfeed.channel",
+        string="Shoppingfeed Channel",
+        help="Indicates the channel from which this sales order originated.",
+        copy=False,
+        readonly=True,
+    )
+    shoppingfeed_status = fields.Char(
+        readonly=True,
+        help="Current status of the order in Shoppingfeed.",
+        copy=False,
+    )
+    shoppingfeed_raw_data = fields.Text(
+        readonly=True,
+        copy=False,
+        help="Complete JSON data received from Shoppingfeed API for this order.",
+    )
+
+    _sql_constraints = [
+        (
+            "unique_shoppingfeed_order_ref_by_company_store",
+            "unique(shoppingfeed_order_ref, company_id, shoppingfeed_store_id)",
+            "This Shoppingfeed order has already been imported!",
+        ),
+    ]
+
+    def _is_shoppingfeed_disable_invoicing(self):
+        return self.shoppingfeed_channel_id.disable_invoicing
+
+    @api.depends("shoppingfeed_channel_id")
+    def _compute_invoice_status(self):
+        res = super()._compute_invoice_status()
+        self.filtered(lambda so: so._is_shoppingfeed_disable_invoicing()).update(
+            {"invoice_status": "no"}
+        )
+        return res
+
+    def _get_invoiceable_lines(self, final=False):
+        lines = super()._get_invoiceable_lines(final=final)
+        return lines.filtered(
+            lambda line: not line.order_id._is_shoppingfeed_disable_invoicing()
+        )
+
+    def _nothing_to_invoice_error_message(self):
+        error = super()._nothing_to_invoice_error_message()
+        channels = self.filtered(
+            lambda so: so._is_shoppingfeed_disable_invoicing()
+        ).shoppingfeed_channel_id
+        if channels:
+            error += self.env._(
+                "\nThe %s channel issues its own invoices, so these orders are "
+                "not invoiced in Odoo.",
+                ", ".join(channels.mapped("name")),
+            )
+        return error
+
+    @api.depends("shoppingfeed_channel_id")
+    def _compute_amount_to_invoice(self):
+        res = super()._compute_amount_to_invoice()
+        for so in self.filtered(lambda so: so._is_shoppingfeed_disable_invoicing()):
+            so.amount_to_invoice = 0
+        return res
+
+    def _shoppingfeed_fetch_orders(self, store):
+        # Fetch orders from Shoppingfeed for the given store.
+        url = f"https://api.shopping-feed.com/v1/store/{store.catalog_id}/order"
+        headers = {
+            "Authorization": store.access_token,
+            "Content-Type": "application/json",
+        }
+        params = {
+            "acknowledgment": store.filter_order_acknowledgment,
+            "limit": 200,
+        }
+        if store.filter_order_status:
+            params["status"] = store.filter_order_status
+        if store.date_download_since:
+            params["since"] = store.date_download_since.isoformat(timespec="seconds")
+        response = requests.get(url, headers=headers, params=params, timeout=60)
+        response.raise_for_status()
+        return response.json().get("_embedded", {}).get("order", [])
+
+    @api.model
+    def _shoppingfeed_format_phone(self, phone_number, country):
+        if not phone_number:
+            return ""
+        phone_sanitized = self._phone_format(
+            number=phone_number, country=country, force_format="INTERNATIONAL"
+        )
+        return phone_sanitized or phone_number
+
+    def _shoppingfeed_prepare_partner(
+        self, billing, store, channel=None, additional_fields=None
+    ):
+        company = billing.get("company") or ""
+        if company:
+            name = company
+            is_company = True
+        else:
+            first = billing.get("firstName") or ""
+            last = billing.get("lastName") or ""
+            name = (
+                f"{first} {last}".strip()
+                or billing.get("email")
+                or "Shoppingfeed Customer"
+            )
+            is_company = False
+        af = additional_fields or {}
+        vat = (
+            af.get("buyer_tax_registration_id")
+            or af.get("mms-customer-tax-id")
+            or af.get("buyer_identification_number")
+            or af.get("buyer_identifier_number")
+        )
+        country = self.env["res.country"].search(
+            [("code", "=", billing.get("country"))], limit=1
+        )
+        vat_vals = {}
+        self._shoppingfeed_prepare_partner_identification(
+            vat_vals, vat, country, is_company
+        )
+        existing = self._shoppingfeed_find_existing_partner(vat_vals, store)
+        if existing:
+            return existing
+        phone = billing.get("phone") or billing.get("mobilePhone")
+        phone = self._shoppingfeed_format_phone(phone, country)
+        vals = {
+            "name": name,
+            "is_company": is_company,
+            "email": billing.get("email"),
+            "street": billing.get("street") or "",
+            "street2": billing.get("street2"),
+            "zip": billing.get("postalCode") or "",
+            "city": billing.get("city"),
+            "phone": phone,
+            "country_id": country.id,
+            "company_id": store.company_id.id,
+        }
+        vals.update(vat_vals)
+        if channel and channel.account_id:
+            vals["property_account_receivable_id"] = channel.account_id.id
+        if channel and channel.payment_method_line_id:
+            vals["property_inbound_payment_method_line_id"] = (
+                channel.payment_method_line_id.id
+            )
+        return self.env["res.partner"].create(vals)
+
+    @api.model
+    def _shoppingfeed_valid_vat(self, vat, country, is_company):
+        """Overwrite by other modules to check valid vat methods"""
+        if self.env["res.partner"]._run_vat_test(vat, country, is_company) is False:
+            return False
+        return True
+
+    @api.model
+    def _shoppingfeed_find_existing_partner(self, vals, store):
+        """Reuse partners by identifiers prepared from Shoppingfeed data."""
+        if not vals.get("vat"):
+            return self.env["res.partner"]
+        return self.env["res.partner"].search(
+            [
+                ("vat", "=", vals["vat"]),
+                ("parent_id", "=", False),
+                ("company_id", "in", [store.company_id.id, False]),
+            ],
+            limit=1,
+        )
+
+    @api.model
+    def _shoppingfeed_format_vat(self, vat, country):
+        if len(vat) > 1 and not vat[1].isalpha():
+            return f"{country.code}{vat}"
+        return vat
+
+    @api.model
+    def _shoppingfeed_prepare_partner_identification(
+        self, vals, vat, country, is_company
+    ):
+        """Add a valid VAT or route an invalid document to extension hooks."""
+        if not vat:
+            return False
+        if country and self._shoppingfeed_valid_vat(vat, country, is_company):
+            vals["vat"] = self._shoppingfeed_format_vat(vat, country)
+            return True
+        self._shoppingfeed_prepare_invalid_vat_vals(vals, vat)
+        return False
+
+    @api.model
+    def _shoppingfeed_prepare_invalid_vat_vals(self, vals, vat):
+        vals["comment"] = _("Shoppingfeed invalid VAT: %s") % vat
+        return vals
+
+    def _shoppingfeed_prepare_shipping(
+        self, shipping, partner, store, address_type="delivery"
+    ):
+        # Prepare or create delivery address for the Shoppingfeed order.
+        if not shipping:
+            return None
+        country = self.env["res.country"].search(
+            [("code", "=", shipping.get("country"))], limit=1
+        )
+        phone = shipping.get("phone") or shipping.get("mobilePhone")
+        phone = self._shoppingfeed_format_phone(phone, country)
+        vat = partner.vat
+        shipping_vals = {
+            "parent_id": partner.id,
+            "type": address_type,
+            "name": (
+                f"{shipping.get('firstName', '')} " f"{shipping.get('lastName', '')}"
+            ).strip()
+            or "Shipping Address",
+            "street": shipping.get("street") or "",
+            "street2": shipping.get("street2"),
+            "zip": shipping.get("postalCode") or "",
+            "city": shipping.get("city"),
+            "phone": phone,
+            "email": shipping.get("email"),
+            "country_id": country.id,
+            "company_id": store.company_id.id,
+        }
+        self._shoppingfeed_prepare_partner_identification(
+            shipping_vals, vat, country, False
+        )
+        shipping_partner = self.env["res.partner"].search(
+            [
+                ("parent_id", "=", partner.id),
+                ("type", "=", address_type),
+                ("name", "=", shipping_vals["name"]),
+                ("street", "=", shipping_vals["street"]),
+                ("zip", "=", shipping_vals["zip"]),
+            ],
+            limit=1,
+        ) or self.env["res.partner"].create(shipping_vals)
+        return shipping_partner
+
+    def _shoppingfeed_clean_product_reference(self, reference):
+        if not reference or "_" not in reference:
+            return reference
+        parts = reference.rsplit("_", 1)
+        if len(parts) == 2 and len(parts[1]) == 2:
+            return parts[0]
+        return reference
+
+    def _shoppingfeed_resolve_product_reference(self, item_reference, aliases=None):
+        """Resolve product reference considering aliases from itemsReferencesAliases.
+        When a SKU is manually edited in ShoppingFeed, the old SKU remains in the
+        item reference but a mapping is created in itemsReferencesAliases pointing
+        to the new SKU. This method resolves the correct SKU to use.
+        """
+        # Check if there's an alias for this reference
+        if aliases and item_reference in aliases:
+            return self._shoppingfeed_clean_product_reference(aliases[item_reference])
+        # Return the cleaned original reference
+        return self._shoppingfeed_clean_product_reference(item_reference)
+
+    def _shoppingfeed_acknowledge_order(self, store, order, sale_order=None):
+        # Acknowledge the imported order to Shoppingfeed.
+        if store._shoppingfeed_is_demo_mode():
+            return
+        url = f"https://api.shopping-feed.com/v1/store/{store.catalog_id}/order/acknowledge"
+        headers = {
+            "Authorization": store.access_token,
+            "Content-Type": "application/json",
+        }
+        order_payload = {
+            "id": int(order.get("id")),
+            "status": "success",
+            "acknowledgedAt": datetime.now(timezone.utc).isoformat(),
+        }
+        if sale_order:
+            order_payload["storeReference"] = sale_order.name
+        payload = {"order": [order_payload]}
+        requests.post(url, json=payload, headers=headers, timeout=60)
+
+    def _shoppingfeed_try_acknowledge_order(self, store, order, channel, sale_order):
+        try:
+            self._shoppingfeed_acknowledge_order(store, order, sale_order)
+        except Exception as e:
+            self._create_shoppingfeed_log(
+                store, order, channel, f"Error acknowledging order: {e}"
+            )
+
+    def _create_shoppingfeed_log(self, store, order, channel, error_message):
+        self.env["shoppingfeed.log"].create(
+            {
+                "name": order.get("reference") or f"Order {order.get('id')}",
+                "store_id": store.id,
+                "channel_id": channel.id if channel else False,
+                "shoppingfeed_reference": order.get("reference"),
+                "error_message": error_message,
+            }
+        )
+
+    def _shoppingfeed_validate_products(self, order):
+        # Validate that all products exist before creating the order.
+        missing_products = []
+        aliases = order.get("itemsReferencesAliases", {})
+        for item in order.get("items", []):
+            ref = item.get("reference")
+            clean_ref = self._shoppingfeed_resolve_product_reference(ref, aliases)
+            product = self.env["product.product"].search(
+                [("default_code", "=", clean_ref)], limit=1
+            )
+            if not product:
+                missing_products.append(clean_ref)
+        return missing_products
+
+    def _shoppingfeed_get_carrier(
+        self, store, channel, carrier_name, partner, shipping_partner=None
+    ):
+        carrier = False
+        shipping_partner = shipping_partner or partner
+        shipping_country = shipping_partner.country_id if shipping_partner else None
+        if carrier_name:
+            carrier_map = store.carrier_map_ids.filtered(
+                lambda m, carrier_name=carrier_name: m.carrier_name.strip().lower()
+                == carrier_name.strip().lower()
+            )
+            if carrier_map:
+                for candidate_carrier in carrier_map.delivery_carrier_ids:
+                    if candidate_carrier._match_address(shipping_partner):
+                        carrier = candidate_carrier
+                        break
+        if not carrier:
+            if channel and shipping_country and channel.country_carrier_ids:
+                country_rule = channel.country_carrier_ids.filtered(
+                    lambda rule, country=shipping_country: rule.country_id == country
+                )
+                if country_rule:
+                    carrier = country_rule[0].delivery_carrier_id
+            if not carrier:
+                if channel and channel.default_delivery_carrier_id:
+                    carrier = channel.default_delivery_carrier_id
+                elif store.default_delivery_carrier_id:
+                    carrier = store.default_delivery_carrier_id
+        return carrier
+
+    def _shoppingfeed_get_tax_data(self, sale_order, line_vals):
+        new_sol = self.env["sale.order.line"].new({**line_vals, "order_id": sale_order})
+        tax_data = new_sol.tax_id.with_context(force_price_include=True).compute_all(
+            line_vals["price_unit"],
+            currency=sale_order.currency_id,
+            quantity=1.0,
+            partner=sale_order.partner_shipping_id,
+        )
+        return tax_data
+
+    def _shoppingfeed_get_original_price_unit(self, line):
+        """Recover the tax-included unit price the customer paid for `line`,
+        as originally sent by Shoppingfeed, from the stored raw order data.
+        """
+        self.ensure_one()
+        if not self.shoppingfeed_raw_data:
+            return False
+        order = json.loads(self.shoppingfeed_raw_data)
+        if line.is_delivery:
+            return (order.get("payment") or {}).get("shippingAmount", 0.0)
+        aliases = order.get("itemsReferencesAliases", {})
+        for item in order.get("items", []):
+            clean_ref = self._shoppingfeed_resolve_product_reference(
+                item.get("reference"), aliases
+            )
+            if clean_ref and line.product_id.default_code == clean_ref:
+                return item.get("price", 0.0)
+        return False
+
+    def _shoppingfeed_prepare_order_line(self, store, item, new_order, aliases=None):
+        ref = item.get("reference")
+        clean_ref = self._shoppingfeed_resolve_product_reference(ref, aliases)
+        product = self.env["product.product"].search(
+            [("default_code", "=", clean_ref)], limit=1
+        )
+        if not product:
+            return False
+        price = item.get("price", product.list_price)
+        vals = {
+            "product_id": product.id,
+            "product_uom_qty": item.get("quantity", 1.0),
+            "price_unit": price,
+            "name": item.get("name") or product.display_name,
+        }
+        # TODO: Add condition to remove taxes depends on store or channel field
+        # if not store.include_taxes_in_price:
+        #     return vals
+        tax_data = self._shoppingfeed_get_tax_data(new_order, vals)
+        vals["price_unit"] = tax_data["total_excluded"]
+        return vals
+
+    def _shoppingfeed_create_sale_order(
+        self,
+        store,
+        order,
+        partner,
+        shipping_partner,
+        sf_channel,
+        order_type_id,
+        carrier,
+    ):
+        # Create sale order and lines from Shoppingfeed data.
+        ext_id = str(order.get("id"))
+        currency = self.env["res.currency"].search(
+            [("name", "=", order.get("payment", {}).get("currency", "EUR"))],
+            limit=1,
+        )
+        aliases = order.get("itemsReferencesAliases", {})
+        billing = order.get("billingAddress") or {}
+        invoice_partner = partner
+        if (billing.get("street") or "", billing.get("postalCode") or "") != (
+            partner.street or "",
+            partner.zip or "",
+        ):
+            invoice_partner = (
+                self._shoppingfeed_prepare_shipping(billing, partner, store, "invoice")
+                or partner
+            )
+        so_vals = {
+            "partner_id": partner.id,
+            "partner_invoice_id": invoice_partner.id,
+            "partner_shipping_id": shipping_partner.id
+            if shipping_partner
+            else partner.id,
+            "client_order_ref": order.get("reference"),
+            "shoppingfeed_reference": order.get("reference"),
+            "currency_id": currency.id,
+            "shoppingfeed_order_ref": ext_id,
+            "shoppingfeed_store_id": store.id,
+            "type_id": order_type_id or store.default_order_type_id.id,
+            "payment_mode_id": store.default_payment_mode_id.id,
+            "payment_term_id": store.default_payment_term_id.id,
+            "shoppingfeed_channel_id": sf_channel.id,
+            "shoppingfeed_status": order.get("status"),
+            "company_id": store.company_id.id,
+            "shoppingfeed_raw_data": json.dumps(order, indent=2, ensure_ascii=False),
+        }
+        new_so = self.new(so_vals)
+        order_lines = []
+        for item in order.get("items", []):
+            line_vals = self._shoppingfeed_prepare_order_line(
+                store, item, new_so, aliases
+            )
+            if line_vals:
+                order_lines.append((0, 0, line_vals))
+        so_vals["order_line"] = order_lines
+        sale_order = self.create(so_vals)
+        if carrier:
+            payment = order.get("payment", {}) or {}
+            # TODO: Add condition to remove taxes depends on store or channel field
+            tax_data = self._shoppingfeed_get_tax_data(
+                new_so,
+                {
+                    "product_id": carrier.product_id.id,
+                    "price_unit": payment.get("shippingAmount", 0.0),
+                },
+            )
+            sale_order.set_delivery_line(carrier, tax_data["total_excluded"])
+        link = (
+            f"https://app.shopping-feed.com/v3/es/orders/detail/"
+            f"{order.get('id')}?store={order.get('storeId')}"
+        )
+        body = Markup(
+            "<p><b>Order created automatically by Shoppingfeed.</b></p>"
+            f"<p><b>Marketplace:</b> {sf_channel.name or 'Unknown'}</p>"
+            f"<p><a href='{link}' target='_blank'>"
+            "View order in Shoppingfeed</a></p>"
+        )
+        sale_order.message_post(
+            body=body, message_type="comment", subtype_xmlid="mail.mt_note"
+        )
+        return sale_order
+
+    @api.model
+    def action_import_from_shoppingfeed(self):
+        stores = (
+            self.env["shoppingfeed.store"]
+            .sudo()
+            .search(
+                [
+                    ("access_token", "!=", False),
+                    ("catalog_id", "!=", False),
+                ]
+            )
+        )
+        for store in stores:
+            try:
+                self.with_company(store.company_id)._import_orders_from_shoppingfeed(
+                    store
+                )
+            except Exception as e:
+                # The cursor may be aborted: reset it to be able to log.
+                self.env.cr.rollback()
+                self.env["shoppingfeed.log"].sudo().create(
+                    {
+                        "name": store.name,
+                        "store_id": store.id,
+                        "error_message": f"Error importing orders: {e}",
+                    }
+                )
+                # Keep the log even if a later store fails.
+                self.env.cr.commit()  # pylint: disable=invalid-commit
+
+    def _import_orders_from_shoppingfeed(self, store):
+        if not store.import_orders:
+            return
+        for order in self._shoppingfeed_fetch_orders(store):
+            ext_id = str(order.get("id"))
+            existing = self.search([("shoppingfeed_order_ref", "=", ext_id)], limit=1)
+            if existing:
+                # Its acknowledgment was lost, otherwise it would not be resent.
+                self._shoppingfeed_try_acknowledge_order(store, order, False, existing)
+                continue
+            channel = (order.get("_embedded") or {}).get("channel", {})
+            channel_name = channel.get("name", "Unknown Marketplace")
+            sf_channel = (
+                self.env["shoppingfeed.channel"]
+                .sudo()
+                .search(
+                    [
+                        ("sf_channel_name", "=", channel_name),
+                        ("store_id", "=", store.id),
+                    ],
+                    limit=1,
+                )
+            )
+            missing_products = self._shoppingfeed_validate_products(order)
+            if missing_products:
+                error_msg = f"Products not found: {', '.join(missing_products)}"
+                self._create_shoppingfeed_log(store, order, sf_channel, error_msg)
+                continue
+            try:
+                with self.env.cr.savepoint():
+                    billing = order.get("billingAddress", {}) or {}
+                    additional_fields = order.get("additionalFields", {}) or {}
+                    partner = self._shoppingfeed_prepare_partner(
+                        billing, store, sf_channel, additional_fields
+                    )
+                    shipping_partner = self._shoppingfeed_prepare_shipping(
+                        order.get("shippingAddress", {}), partner, store
+                    )
+                    # Type mapping
+                    mapping = store.marketplace_customer_group_ids.filtered(
+                        lambda m,
+                        channel_name=channel_name: m.channel_id.sf_channel_name
+                        == channel_name
+                    )
+                    order_type_id = mapping.order_type_id.id if mapping else False
+                    # Carrier mapping
+                    shipment = order.get("shipment", {}) or {}
+                    carrier_name = shipment.get("carrier")
+                    carrier = self._shoppingfeed_get_carrier(
+                        store, sf_channel, carrier_name, partner, shipping_partner
+                    )
+                    new_sale = self._shoppingfeed_create_sale_order(
+                        store,
+                        order,
+                        partner,
+                        shipping_partner,
+                        sf_channel,
+                        order_type_id,
+                        carrier,
+                    )
+                    if sf_channel.auto_confirm_sale:
+                        new_sale.action_confirm()
+            except Exception as e:
+                error_msg = f"Error creating order: {str(e)}"
+                self._create_shoppingfeed_log(store, order, sf_channel, error_msg)
+                continue
+            # Commit before acknowledging: Shoppingfeed never resends an
+            # acknowledged order, so a rollback after the ack would lose it.
+            self.env.cr.commit()  # pylint: disable=invalid-commit
+            self._shoppingfeed_try_acknowledge_order(store, order, sf_channel, new_sale)
+
+
+class SaleOrderLine(models.Model):
+    _inherit = "sale.order.line"
+
+    @api.depends("order_id.shoppingfeed_channel_id")
+    def _compute_invoice_status(self):
+        res = super()._compute_invoice_status()
+        self.filtered(
+            lambda sol: sol.order_id._is_shoppingfeed_disable_invoicing()
+        ).invoice_status = "no"
+        return res
+
+    def _compute_tax_id(self):
+        """Keep the tax-included total the customer paid on Shoppingfeed
+        orders unchanged whenever taxes are recomputed later (e.g. a fiscal
+        position change triggered by a VIES validation): re-derive
+        price_unit from the original price stored in shoppingfeed_raw_data
+        and the tax now applying, the same way it was computed on import.
+        """
+        res = super()._compute_tax_id()
+        for line in self.filtered(lambda sol: sol.order_id.shoppingfeed_order_ref):
+            original_price = line.order_id._shoppingfeed_get_original_price_unit(line)
+            if not original_price:
+                continue
+            tax_data = line.tax_id.with_context(force_price_include=True).compute_all(
+                original_price,
+                currency=line.order_id.currency_id,
+                quantity=1.0,
+                partner=line.order_id.partner_shipping_id,
+            )
+            line.price_unit = tax_data["total_excluded"]
+        return res

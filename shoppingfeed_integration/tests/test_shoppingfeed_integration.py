@@ -1,0 +1,420 @@
+# Copyright 2026 Juan Carlos Oñate - Tecnativa <juancarlos.onate@tecnativa.com>
+# License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl.html).
+
+from odoo import Command
+from odoo.exceptions import UserError
+from odoo.tests import tagged
+
+from odoo.addons.account.tests.common import AccountTestInvoicingCommon
+
+
+@tagged("post_install", "-at_install")
+class TestShoppingfeedIntegration(AccountTestInvoicingCommon):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.bank_journal = cls.company_data["default_journal_bank"]
+        cls.market_account = cls.company_data["default_account_receivable"].copy(
+            {"name": "SF Market Clearing"}
+        )
+        cls.inbound_payment_method_line = cls.env["account.payment.method.line"].create(
+            {
+                "name": "SF Inbound Payment Method",
+                "payment_method_id": cls.bank_journal.available_payment_method_ids[
+                    0
+                ].id,
+                "payment_type": "inbound",
+                "journal_id": cls.bank_journal.id,
+                "payment_account_id": cls.market_account.id,
+            }
+        )
+        cls.outbound_manual_method = cls.env["account.payment.method"].search(
+            [("code", "=", "manual"), ("payment_type", "=", "outbound")], limit=1
+        )
+        cls.outbound_payment_method_line = cls.env[
+            "account.payment.method.line"
+        ].create(
+            {
+                "name": "SF Outbound Payment Method",
+                "payment_method_id": cls.outbound_manual_method.id,
+                "payment_type": "outbound",
+                "journal_id": cls.bank_journal.id,
+                "payment_account_id": cls.market_account.id,
+            }
+        )
+        cls.sf_store = cls.env["shoppingfeed.store"].create(
+            {
+                "name": "Test SF Store",
+                "username": "test_user",
+                "password": "test_pass",
+                "company_id": cls.env.company.id,
+            }
+        )
+        cls.sf_channel = cls.env["shoppingfeed.channel"].create(
+            {
+                "name": "Test Channel",
+                "store_id": cls.sf_store.id,
+                "payment_method_line_id": cls.inbound_payment_method_line.id,
+                "auto_pay": True,
+            }
+        )
+        cls.product_a.default_code = "TEST-SKU-001"
+
+    @classmethod
+    def _sf_order_line(cls, product=None):
+        product = product or cls.product_a
+        return Command.create(
+            {
+                "product_id": product.id,
+                "product_uom_qty": 1.0,
+                "price_unit": product.list_price,
+            }
+        )
+
+    def _sf_refund(self, sale_order, product=None):
+        product = product or self.product_a
+        return self.env["account.move"].create(
+            {
+                "move_type": "out_refund",
+                "partner_id": sale_order.partner_id.id,
+                "invoice_origin": sale_order.name,
+                "invoice_line_ids": [
+                    Command.create(
+                        {
+                            "product_id": product.id,
+                            "quantity": 1.0,
+                            "price_unit": product.list_price,
+                            "sale_line_ids": [Command.set(sale_order.order_line.ids)],
+                        }
+                    )
+                ],
+            }
+        )
+
+    def test_partner_gets_payment_method_on_create(self):
+        """New partner created during SF import receives
+        property_inbound_payment_method_line_id from the channel."""
+        billing = {
+            "email": "sf_new_customer@example.com",
+            "firstName": "SF",
+            "lastName": "Customer",
+            "street": "Calle Test 1",
+            "postalCode": "28001",
+            "city": "Madrid",
+            "country": "ES",
+            "phone": "600000000",
+        }
+        partner = self.env["sale.order"]._shoppingfeed_prepare_partner(
+            billing, self.sf_store, channel=self.sf_channel
+        )
+        self.assertRecordValues(
+            partner,
+            [
+                {
+                    "property_inbound_payment_method_line_id": (
+                        self.inbound_payment_method_line.id
+                    )
+                }
+            ],
+        )
+
+    def test_billing_partner_dedup_by_vat(self):
+        SO = self.env["sale.order"]
+        billing = {
+            "company": "Amazon Business EU SARL",
+            "email": "ab@example.com",
+            "street": "38 avenue John F. Kennedy",
+            "postalCode": "L-1855",
+            "city": "Luxembourg",
+            "country": "LU",
+        }
+        af_de = {"buyer_tax_registration_id": "DE319514546"}
+        p1 = SO._shoppingfeed_prepare_partner(
+            billing, self.sf_store, channel=self.sf_channel, additional_fields=af_de
+        )
+        p2 = SO._shoppingfeed_prepare_partner(
+            billing, self.sf_store, channel=self.sf_channel, additional_fields=af_de
+        )
+        self.assertEqual(p1, p2)
+        moved = dict(billing, street="1 rue de la Gare", postalCode="L-1611")
+        order = SO._shoppingfeed_create_sale_order(
+            self.sf_store,
+            {"id": "SF-DEDUP-1", "billingAddress": moved, "items": []},
+            p2,
+            None,
+            self.sf_channel,
+            False,
+            False,
+        )
+        self.assertRecordValues(
+            order.partner_invoice_id,
+            [{"parent_id": p1.id, "type": "invoice", "street": "1 rue de la Gare"}],
+        )
+        p3 = SO._shoppingfeed_prepare_partner(
+            billing,
+            self.sf_store,
+            channel=self.sf_channel,
+            additional_fields={"buyer_tax_registration_id": "IT13397910962"},
+        )
+        self.assertNotEqual(p1, p3)
+        b2c = {
+            "firstName": "John",
+            "lastName": "Doe",
+            "email": "jd@example.com",
+            "country": "ES",
+        }
+        c1 = SO._shoppingfeed_prepare_partner(
+            b2c, self.sf_store, channel=self.sf_channel
+        )
+        c2 = SO._shoppingfeed_prepare_partner(
+            b2c, self.sf_store, channel=self.sf_channel
+        )
+        self.assertNotEqual(c1, c2)
+
+    def test_invalid_billing_vat_goes_to_comment(self):
+        billing = {
+            "firstName": "John",
+            "lastName": "Invalid",
+            "email": "john.invalid@example.com",
+            "country": "ES",
+        }
+        partner = self.env["sale.order"]._shoppingfeed_prepare_partner(
+            billing,
+            self.sf_store,
+            additional_fields={"buyer_tax_registration_id": "12345678A"},
+        )
+        self.assertFalse(partner.vat)
+        self.assertIn("Shoppingfeed invalid VAT", partner.comment)
+        self.assertIn("12345678A", partner.comment)
+
+    def test_invoice_auto_paid_on_post(self):
+        """Invoice from a SF order with auto_pay=True is paid on confirmation."""
+        self.partner_a.property_inbound_payment_method_line_id = (
+            self.inbound_payment_method_line
+        )
+        sale_order = self.env["sale.order"].create(
+            {
+                "partner_id": self.partner_a.id,
+                "shoppingfeed_order_ref": "SF-TEST-AUTOPAY-001",
+                "shoppingfeed_store_id": self.sf_store.id,
+                "shoppingfeed_channel_id": self.sf_channel.id,
+                "order_line": [self._sf_order_line()],
+            }
+        )
+        sale_order.action_confirm()
+        invoice = sale_order._create_invoices()
+        invoice.action_post()
+        self.assertEqual(invoice.payment_state, "paid")
+
+    def test_invoice_not_auto_paid_when_disabled(self):
+        """Invoice is NOT auto-paid when channel has auto_pay=False."""
+        self.sf_channel.auto_pay = False
+        self.partner_a.property_inbound_payment_method_line_id = (
+            self.inbound_payment_method_line
+        )
+        sale_order = self.env["sale.order"].create(
+            {
+                "partner_id": self.partner_a.id,
+                "shoppingfeed_order_ref": "SF-TEST-NOPAY-001",
+                "shoppingfeed_store_id": self.sf_store.id,
+                "shoppingfeed_channel_id": self.sf_channel.id,
+                "order_line": [self._sf_order_line()],
+            }
+        )
+        sale_order.action_confirm()
+        invoice = sale_order._create_invoices()
+        invoice.action_post()
+        self.assertNotEqual(invoice.payment_state, "paid")
+        self.sf_channel.auto_pay = True
+
+    def test_refund_auto_paid_on_channel_account(self):
+        self.partner_a.property_inbound_payment_method_line_id = (
+            self.inbound_payment_method_line
+        )
+        sale_order = self.env["sale.order"].create(
+            {
+                "partner_id": self.partner_a.id,
+                "shoppingfeed_order_ref": "SF-TEST-REFUND-001",
+                "shoppingfeed_store_id": self.sf_store.id,
+                "shoppingfeed_channel_id": self.sf_channel.id,
+                "order_line": [self._sf_order_line()],
+            }
+        )
+        sale_order.action_confirm()
+        self.sf_channel.auto_pay = False
+        unpaid = self._sf_refund(sale_order)
+        unpaid.action_post()
+        self.assertNotEqual(unpaid.payment_state, "paid")
+        self.sf_channel.auto_pay = True
+        refund = self._sf_refund(sale_order)
+        refund.action_post()
+        self.assertEqual(refund.payment_state, "paid")
+        payment = refund.reconciled_payment_ids
+        self.assertEqual(len(payment), 1)
+        self.assertEqual(payment.payment_type, "outbound")
+        self.assertEqual(
+            payment.payment_method_line_id, self.outbound_payment_method_line
+        )
+        self.assertEqual(
+            payment.payment_method_line_id.payment_account_id, self.market_account
+        )
+
+    def test_product_reference_cleaning(self):
+        """_shoppingfeed_clean_product_reference strips 2-char country suffixes only."""
+        so = self.env["sale.order"]
+        self.assertEqual(
+            so._shoppingfeed_clean_product_reference("SKU123_ES"), "SKU123"
+        )
+        self.assertEqual(
+            so._shoppingfeed_clean_product_reference("SKU123_FR"), "SKU123"
+        )
+        self.assertEqual(so._shoppingfeed_clean_product_reference("SKU123"), "SKU123")
+        self.assertEqual(
+            so._shoppingfeed_clean_product_reference("SKU123_EUR"), "SKU123_EUR"
+        )
+
+    def test_product_reference_resolution_with_alias(self):
+        """_shoppingfeed_resolve_product_reference follows alias mapping."""
+        so = self.env["sale.order"]
+        aliases = {"OLD-SKU": "NEW-SKU_ES"}
+        self.assertEqual(
+            so._shoppingfeed_resolve_product_reference("OLD-SKU", aliases), "NEW-SKU"
+        )
+        self.assertEqual(
+            so._shoppingfeed_resolve_product_reference("DIRECT_ES", aliases), "DIRECT"
+        )
+
+    def test_validate_products_all_found(self):
+        """_shoppingfeed_validate_products returns empty list when all SKUs exist."""
+        order = {
+            "items": [{"reference": "TEST-SKU-001"}],
+            "itemsReferencesAliases": {},
+        }
+        self.assertEqual(
+            self.env["sale.order"]._shoppingfeed_validate_products(order), []
+        )
+
+    def test_validate_products_missing_sku(self):
+        """_shoppingfeed_validate_products returns missing SKUs."""
+        order = {
+            "items": [{"reference": "NONEXISTENT-SKU"}],
+            "itemsReferencesAliases": {},
+        }
+        missing = self.env["sale.order"]._shoppingfeed_validate_products(order)
+        self.assertIn("NONEXISTENT-SKU", missing)
+
+    def test_create_sale_order_from_sf_data(self):
+        """_shoppingfeed_create_sale_order creates a sale.order with SF metadata."""
+        order_dict = {
+            "id": "SF-999001",
+            "reference": "MKT-TEST-REF-001",
+            "status": "waiting_shipment",
+            "payment": {"currency": "EUR", "shippingAmount": 0.0},
+            "items": [],
+            "itemsReferencesAliases": {},
+            "storeId": "test",
+        }
+        sale_order = self.env["sale.order"]._shoppingfeed_create_sale_order(
+            self.sf_store,
+            order_dict,
+            self.partner_a,
+            None,
+            self.sf_channel,
+            False,
+            False,
+        )
+        self.assertRecordValues(
+            sale_order,
+            [
+                {
+                    "shoppingfeed_order_ref": "SF-999001",
+                    "shoppingfeed_reference": "MKT-TEST-REF-001",
+                    "client_order_ref": "MKT-TEST-REF-001",
+                    "shoppingfeed_channel_id": self.sf_channel.id,
+                    "shoppingfeed_store_id": self.sf_store.id,
+                    "partner_id": self.partner_a.id,
+                }
+            ],
+        )
+
+    def test_price_preserved_when_fiscal_position_changes(self):
+        """The tax-included total the customer paid on Shoppingfeed must not
+        change when the order's taxes get recomputed later (e.g. a fiscal
+        position change triggered by a VIES validation), even though
+        price_unit is always stored tax-excluded.
+        """
+        self.product_a.taxes_id = self.tax_sale_a
+        order_dict = {
+            "id": "SF-PRICE-001",
+            "reference": "MKT-PRICE-001",
+            "status": "waiting_shipment",
+            "payment": {"currency": "EUR", "shippingAmount": 0.0},
+            "items": [{"reference": "TEST-SKU-001", "price": 12.50, "quantity": 1}],
+            "itemsReferencesAliases": {},
+            "storeId": "test",
+        }
+        sale_order = self.env["sale.order"]._shoppingfeed_create_sale_order(
+            self.sf_store,
+            order_dict,
+            self.partner_a,
+            None,
+            self.sf_channel,
+            False,
+            False,
+        )
+        self.assertAlmostEqual(sale_order.amount_total, 12.50, places=2)
+
+        zero_tax = self.tax_sale_a.copy({"name": "Zero tax test", "amount": 0.0})
+        fiscal_position = self.env["account.fiscal.position"].create(
+            {
+                "name": "Test intracom",
+                "company_id": self.env.company.id,
+                "tax_ids": [
+                    Command.create(
+                        {
+                            "tax_src_id": self.tax_sale_a.id,
+                            "tax_dest_id": zero_tax.id,
+                        }
+                    )
+                ],
+            }
+        )
+        sale_order.fiscal_position_id = fiscal_position
+        sale_order.action_update_taxes()
+
+        self.assertEqual(sale_order.order_line.tax_id, zero_tax)
+        self.assertAlmostEqual(sale_order.order_line.price_unit, 12.50, places=2)
+        self.assertAlmostEqual(sale_order.amount_total, 12.50, places=2)
+
+    def test_channel_disabling_invoicing_has_no_invoiceable_lines(self):
+        self.product_a.invoice_policy = "order"
+        order = self.env["sale.order"].create(
+            {
+                "partner_id": self.partner_a.id,
+                "shoppingfeed_channel_id": self.sf_channel.id,
+                "order_line": [
+                    Command.create(
+                        {"product_id": self.product_a.id, "product_uom_qty": 1}
+                    )
+                ],
+            }
+        )
+        order.action_confirm()
+        # The channel invoices in Odoo as usual
+        self.assertTrue(order._get_invoiceable_lines())
+        # Once it issues its own invoices, nothing is invoiceable here
+        self.sf_channel.disable_invoicing = True
+        order.invalidate_recordset()
+        self.assertFalse(order._get_invoiceable_lines())
+        with self.assertRaises(UserError):
+            order._create_invoices()
+        # Orders of other channels invoiced along with it are not affected
+        other = order.copy(
+            {
+                "shoppingfeed_channel_id": self.sf_channel.copy(
+                    {"disable_invoicing": False}
+                ).id
+            }
+        )
+        other.action_confirm()
+        self.assertEqual((order | other)._get_invoiceable_lines().order_id, other)
